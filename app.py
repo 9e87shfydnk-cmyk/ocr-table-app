@@ -1,35 +1,79 @@
 import streamlit as st
 import pandas as pd
-from st_aggrid import AgGrid, GridOptionsBuilder
+import cv2
+import numpy as np
+import pytesseract
+from PIL import Image
 
-# 1. ここに OCR で取り込んだデータを貼り付け
-data = [
-    {
-        "艇": 1, "登番": 3947, "氏名": "寺本 昇平", "支部/出身地": "群馬 神奈川", "登録期/年齢": "82期 49歳",
-        "FL": 0, "級別": "B1", "平均ST": 0.17, "勝率": 4.57, "全国2連率": 20.1, "全国近況2連率": 23.1, "当地2連率": 15.7,
-        "モーター番号": 29, "モーター2連率": 28.5, "ボート番号": 72, "ボート2連率": 37.7
-    },
-    # 2～6号艇分を同様に追加…
-]
+st.set_page_config(layout="wide")
+st.title("📷→表OCR＋セル修正ツール")
 
-df = pd.DataFrame(data)
+# --- 1. 画像アップロード ---
+uploaded = st.file_uploader("1. 表の写真をアップロードしてください", type=["jpg","jpeg","png"])
+if not uploaded:
+    st.warning("まずは上のボタンから画像を選んでください")
+    st.stop()
 
-st.title("OCR結果 手動修正ツール")
+# --- 2. 画像前処理＋OCRセル抽出関数 ---
+@st.cache_data
+def ocr_table(img_bytes):
+    # OpenCV で読み込み・前処理
+    arr = np.frombuffer(img_bytes, np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    # コントラスト強調＆二値化
+    gray = cv2.equalizeHist(gray)
+    _, th = cv2.threshold(gray,0,255,cv2.THRESH_BINARY+cv2.THRESH_OTSU)
+    # 縦横線を抽出→テーブルマスク
+    vert = cv2.getStructuringElement(cv2.MORPH_RECT, (1,40))
+    horz = cv2.getStructuringElement(cv2.MORPH_RECT, (40,1))
+    mask = cv2.morphologyEx(th, cv2.MORPH_OPEN, vert) + \
+           cv2.morphologyEx(th, cv2.MORPH_OPEN, horz)
+    # 輪郭検出→セル矩形
+    cnts,_ = cv2.findContours(mask, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    rects = [cv2.boundingRect(c) for c in cnts if cv2.boundingRect(c)[2]>30 and cv2.boundingRect(c)[3]>20]
+    # ソートして行列化（簡易）
+    rects = sorted(rects, key=lambda b:(b[1],b[0]))
+    texts = []
+    for x,y,w,h in rects:
+        cell = th[y:y+h, x:x+w]
+        txt = pytesseract.image_to_string(cell, lang='jpn', config='--psm 6').strip()
+        texts.append((y,x,txt))
+    # 行ごとにグルーピング（行間隔閾値で分割）
+    rows = []
+    current = []
+    last_y = None
+    for y,x,txt in sorted(texts):
+        if last_y is None or abs(y-last_y)<10:
+            current.append(txt)
+        else:
+            rows.append(current)
+            current = [txt]
+        last_y = y
+    if current:
+        rows.append(current)
+    # DataFrame 化。列数は最大列数に合わせる
+    max_cols = max(len(r) for r in rows)
+    df = pd.DataFrame([r + [""]*(max_cols-len(r)) for r in rows])
+    return df
 
-gb = GridOptionsBuilder.from_dataframe(df)
-gb.configure_default_column(editable=True)
-grid_options = gb.build()
+# OCR実行
+img_bytes = uploaded.read()
+df = ocr_table(img_bytes)
 
-st.markdown("#### 誤りがあるセルをクリックして修正できます")
-grid_response = AgGrid(df, gridOptions=grid_options, update_mode="MODEL_CHANGED",
-                        height=300, fit_columns_on_grid_load=True)
+st.markdown("2. OCR 結果（自動読み取り）")
+st.dataframe(df, use_container_width=True)
 
-edited_df = pd.DataFrame(grid_response["data"])
-st.markdown("#### 修正後のデータプレビュー")
-st.dataframe(edited_df)
+# --- 3. 編集可能テーブル ---
+st.markdown("3. 自動読み取りミスがあるセルだけ直してください")
+edited = st.data_editor(df, num_rows="dynamic", use_container_width=True)
 
-csv_bytes = edited_df.to_csv(index=False, encoding='utf-8-sig').encode()
-json_str = edited_df.to_json(orient="records", force_ascii=False)
-
-st.download_button("CSVでダウンロード", csv_bytes, "corrected_data.csv", "text/csv")
-st.download_button("JSONでダウンロード", json_str, "corrected_data.json", "application/json")
+# --- 4. ダウンロード ---
+st.markdown("4. 修正後データをダウンロード")
+csv = edited.to_csv(index=False, encoding='utf-8-sig').encode()
+json_str = edited.to_json(orient="records", force_ascii=False)
+col1, col2 = st.columns(2)
+with col1:
+    st.download_button("📥 CSV でダウンロード", csv, "table.csv", "text/csv")
+with col2:
+    st.download_button("📥 JSON でダウンロード", json_str, "table.json", "application/json")
